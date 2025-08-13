@@ -1,15 +1,22 @@
 # app_trim_pivot.py
-import io
 import os
-import pandas as pd
-import streamlit as st
-from collections import Counter
 from io import BytesIO
 from typing import List, Optional
+from collections import Counter
 
+import pandas as pd
+import streamlit as st
+
+# =========================
+# App meta
+# =========================
 st.set_page_config(page_title="CẮT & PIVOT SKU", layout="wide")
-st.title("✂️ CẮT FILE & 📊 PIVOT SẢN LƯỢNG/DOANH SỐ THEO KH")
-st.caption("Tối ưu cho file Excel lớn: Bước 1 cắt cột bằng streaming (không load toàn bộ), Bước 2 pivot theo khách hàng.")
+st.markdown(
+    "<h1>✂️ CẮT FILE & 📊 PIVOT SẢN LƯỢNG/DOANH SỐ THEO KH</h1>"
+    "<p style='color:#666'>Tối ưu cho file Excel lớn: Bước 1 cắt cột bằng streaming (không load toàn bộ), "
+    "Bước 2 pivot theo khách hàng.</p>",
+    unsafe_allow_html=True,
+)
 
 # =========================
 # CẤU HÌNH BƯỚC 1 (CẮT CỘT)
@@ -27,7 +34,7 @@ REQUIRED = [
 
 # Nếu hàng tiêu đề của file “đã cắt” không đúng tên, ta map nhanh theo chỉ số cột
 INDEX_TO_REQUIRED = {
-    0: "Tên NPP",                 # tương ứng D ban đầu (ví dụ)
+    0: "Tên NPP",                 # (ứng với cột D ban đầu)
     1: "Mã KH",                   # L
     2: "Tên KH",                  # M
     3: "Nhóm hàng",               # Q
@@ -38,12 +45,6 @@ INDEX_TO_REQUIRED = {
 }
 
 # ========= Helpers chung =========
-def _safe_int(x):
-    try:
-        return int(x)
-    except Exception:
-        return 0
-
 def _mode_text(series):
     vals = [str(x).strip() for x in series if str(x).strip() and str(x).strip().lower() != "nan"]
     if not vals:
@@ -54,48 +55,52 @@ def _mode_text(series):
     return sorted([v for v, c in cnt.items() if c == mx])[0]
 
 # ========= BƯỚC 1: CẮT FILE BẰNG STREAMING =========
-def stream_cut_excel(file_bytes: bytes,
-                     sheet_name: Optional[str] = None,
-                     col_indices: List[int] = COL_INDICES,
-                     preserve_all_rows: bool = True) -> bytes:
+def stream_cut_excel(
+    file_bytes: bytes,
+    sheet_name: Optional[str] = None,
+    col_indices: List[int] = COL_INDICES,
+    preserve_all_rows: bool = True
+) -> bytes:
     """
     Đọc Excel bằng openpyxl streaming, chỉ lấy các cột theo index (0-based).
-    - Không load toàn bộ file vào RAM.
+    - Không load toàn bộ file vào RAM (read_only + write_only).
     - Giữ nguyên số dòng (kể cả dòng trống) nếu preserve_all_rows=True.
     Trả về bytes nội dung .xlsx đã cắt (8 cột).
     """
-    from openpyxl import load_workbook
-    from openpyxl.writer.excel import save_virtual_workbook
-    from openpyxl.workbook import Workbook
+    from openpyxl import load_workbook, Workbook
 
     # 1) Mở workbook nguồn ở chế độ read-only
     bio = BytesIO(file_bytes)
     wb_src = load_workbook(bio, read_only=True, data_only=True)
     ws_src = wb_src[sheet_name] if sheet_name and sheet_name in wb_src.sheetnames else wb_src.active
 
-    # 2) Tạo workbook đích (write-only → nhẹ RAM)
-    from openpyxl import Workbook
+    # 2) Workbook đích write-only → nhẹ RAM
     wb_out = Workbook(write_only=True)
     ws_out = wb_out.create_sheet(title=ws_src.title)
 
+    max_idx = max(col_indices)
+
     # 3) Duyệt từng dòng, trích cột theo index
     for row in ws_src.iter_rows(values_only=True):
-        # đảm bảo đủ độ dài
-        row = list(row)
-        if len(row) <= max(col_indices):
-            # hàng này thiếu cột ở đuôi → fill None
-            row = row + [None] * (max(col_indices) - len(row) + 1)
+        row = list(row) if row is not None else []
+        if len(row) <= max_idx:
+            row = row + [None] * (max_idx - len(row) + 1)
         new_row = [row[i] for i in col_indices]
+
         if preserve_all_rows:
             ws_out.append(new_row)
         else:
-            # (tuỳ chọn) bỏ dòng trống hoàn toàn
-            if any(cell is not None and str(cell).strip() != "" for cell in new_row):
+            # chỉ ghi dòng có ít nhất 1 ô khác rỗng
+            if any((c is not None) and str(c).strip() != "" for c in new_row):
                 ws_out.append(new_row)
 
-    # 4) Xuất bytes
-    out_bytes = save_virtual_workbook(wb_out)
-    return out_bytes
+    # 4) Xuất bytes (thay cho save_virtual_workbook)
+    out_buf = BytesIO()
+    wb_out.save(out_buf)
+    wb_src.close()
+    wb_out.close()
+    out_buf.seek(0)
+    return out_buf.getvalue()
 
 # ========= BƯỚC 2: PIVOT THEO KH =========
 def normalize_after_cut(df: pd.DataFrame, header_row_user: int) -> pd.DataFrame:
@@ -106,11 +111,11 @@ def normalize_after_cut(df: pd.DataFrame, header_row_user: int) -> pd.DataFrame:
     """
     # Nếu người dùng chọn header ở dòng khác 1 → đọc lại với header phù hợp
     if header_row_user != 1:
-        # chuyển DataFrame hiện tại thành Excel bytes rồi đọc lại với header=header_row_user-1
         buf = BytesIO()
+        # ghi tạm không header để giữ nguyên dữ liệu
         df.to_excel(buf, index=False, header=False)
         buf.seek(0)
-        df = pd.read_excel(buf, header=header_row_user - 1)
+        df = pd.read_excel(buf, header=header_row_user - 1, engine="openpyxl")
 
     # Chuẩn hoá tên về str
     df.columns = [str(c).strip() for c in df.columns]
@@ -176,13 +181,16 @@ st.header("Bước 1 — ✂️ Cắt cột từ file nặng (streaming, không 
 with st.expander("Chọn & cắt file", expanded=True):
     c1, c2 = st.columns([2,1])
     with c1:
-        raw_file = st.file_uploader("Upload file Excel GỐC (có thể rất lớn)", type=["xlsx", "xlsm", "xlsb", "xls"])
+        # openpyxl không đọc được .xlsb → ưu tiên xlsx/xlsm/xls
+        raw_file = st.file_uploader(
+            "Upload file Excel GỐC (có thể rất lớn)",
+            type=["xlsx", "xlsm", "xls"],
+            key="raw_upload"
+        )
     with c2:
-        sheet_hint = st.text_input("Tên sheet (bỏ trống = sheet đầu tiên)", value="")
+        sheet_hint = st.text_input("Tên sheet (bỏ trống = sheet đầu tiên)", value="", key="raw_sheet")
 
     if raw_file:
-        # Tăng giới hạn upload nếu deploy tại chỗ (tuỳ chọn)
-        # st.set_option("server.maxUploadSize", 500)  # MB
         with st.spinner("Đang cắt cột bằng streaming..."):
             trimmed_bytes = stream_cut_excel(
                 file_bytes=raw_file.read(),
@@ -197,6 +205,7 @@ with st.expander("Chọn & cắt file", expanded=True):
             file_name=f"{os.path.splitext(raw_file.name)[0]}_filtered_preserve.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
+            key="dl_trimmed",
         )
         st.session_state["trimmed_bytes"] = trimmed_bytes
 
@@ -208,7 +217,8 @@ st.header("Bước 2 — 📊 Pivot sản lượng & doanh số theo Khách Hàn
 src_choice = st.radio(
     "Chọn nguồn file ‘đã cắt’ để pivot:",
     ["Upload mới", "Dùng file đã cắt ở Bước 1"],
-    horizontal=True
+    horizontal=True,
+    key="pivot_source",
 )
 
 trimmed_to_use = None
@@ -224,23 +234,20 @@ else:
 
 # Chọn dòng tiêu đề (nếu header trong file không nằm ở dòng 1)
 header_row_user = st.number_input(
-    "Dòng tiêu đề trong file đã cắt (1 = dòng đầu)", min_value=1, value=1, step=1
+    "Dòng tiêu đề trong file đã cắt (1 = dòng đầu)",
+    min_value=1, value=1, step=1, key="header_row_user"
 )
 
-if trimmed_to_use and st.button("🚀 Pivot ngay", use_container_width=True):
+if trimmed_to_use and st.button("🚀 Pivot ngay", use_container_width=True, key="do_pivot"):
     try:
         with st.spinner("Đang đọc & chuẩn hoá dữ liệu..."):
-            # Đọc toàn bộ sheet đầu tiên
-            df_cut = pd.read_excel(BytesIO(trimmed_to_use), header=None, dtype=object, engine="openpyxl")
-            # Đặt tên tạm theo index nếu không có header
+            # Đọc nhanh để xác định header
             if header_row_user == 1:
-                # đọc lại với header=0 để giữ hàng đầu tiên làm tên cột (nếu có)
-                df_cut_named = pd.read_excel(BytesIO(trimmed_to_use), header=0, dtype=object, engine="openpyxl")
+                df_cut = pd.read_excel(BytesIO(trimmed_to_use), header=0, dtype=object, engine="openpyxl")
             else:
-                # giữ nguyên, normalize_after_cut sẽ đọc lại theo header_row_user
-                df_cut_named = df_cut
+                df_cut = pd.read_excel(BytesIO(trimmed_to_use), header=None, dtype=object, engine="openpyxl")
 
-            df_norm = normalize_after_cut(df_cut_named, header_row_user=header_row_user)
+            df_norm = normalize_after_cut(df_cut, header_row_user=header_row_user)
 
             # Kiểm tra thiếu cột thiết yếu
             miss = [c for c in REQUIRED if c not in df_norm.columns]
@@ -264,14 +271,15 @@ if trimmed_to_use and st.button("🚀 Pivot ngay", use_container_width=True):
             file_name="pivot_sku_theo_khachhang.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
+            key="dl_pivot",
         )
 
         with st.expander("⚙️ Tùy chọn lọc nhanh"):
             col1, col2 = st.columns(2)
             with col1:
-                kw = st.text_input("Tìm theo Mã KH / Tên KH / NPP", "")
+                kw = st.text_input("Tìm theo Mã KH / Tên KH / NPP", "", key="quick_kw")
             with col2:
-                min_rev = st.number_input("Lọc Tổng Doanh số ≥", min_value=0, value=0, step=50_000)
+                min_rev = st.number_input("Lọc Tổng Doanh số ≥", min_value=0, value=0, step=50_000, key="quick_minrev")
 
             filt = pivot_df.copy()
             if kw:
